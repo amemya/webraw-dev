@@ -24,6 +24,7 @@ const TAG_PROFILE_LOOK_TABLE_DIMS: u16 = 50981;
 const TAG_PROFILE_LOOK_TABLE_DATA: u16 = 50982;
 const TAG_PROFILE_NAME: u16 = 50936;
 const TAG_PROFILE_HUE_SAT_MAP_ENCODING: u16 = 51107;
+const TAG_PROFILE_LOOK_TABLE_ENCODING: u16 = 51108;
 
 /// TIFF type IDs
 const TYPE_SHORT: u16 = 3;  // u16
@@ -114,6 +115,9 @@ pub struct DcpProfile {
     pub look_table_dims: Option<HueSatMapDims>,
     pub look_table_data: Option<Vec<HueSatMapEntry>>,
 
+    /// LookTable encoding (0 = linear, 1 = sRGB)
+    pub look_table_encoding: u32,
+
     /// Tone curve as (input, output) pairs
     pub tone_curve: Option<Vec<(f32, f32)>>,
 }
@@ -134,6 +138,7 @@ impl Default for DcpProfile {
             hue_sat_map_encoding: 0,
             look_table_dims: None,
             look_table_data: None,
+            look_table_encoding: 0,
             tone_curve: None,
         }
     }
@@ -243,6 +248,9 @@ fn parse_ifd(data: &[u8], offset: usize, le: bool, profile: &mut DcpProfile) -> 
             }
             TAG_PROFILE_LOOK_TABLE_DATA => {
                 profile.look_table_data = Some(read_hue_sat_data(data, value_ptr, typ, count, le));
+            }
+            TAG_PROFILE_LOOK_TABLE_ENCODING => {
+                profile.look_table_encoding = read_short_or_long(data, value_ptr, typ, le);
             }
             TAG_PROFILE_TONE_CURVE => {
                 profile.tone_curve = Some(read_tone_curve(data, value_ptr, typ, count, le));

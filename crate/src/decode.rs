@@ -96,8 +96,8 @@ pub fn decode_raw_bytes(data: &[u8]) -> Result<DecodeResult, String> {
         // Estimate color temperature from WB coefficients
         let temperature = estimate_color_temperature(&wb_coeffs);
 
-        // Apply full DNG pipeline: ForwardMatrix → ProPhoto → LookTable → sRGB → ToneCurve
-        // Output is display-referred (tone curve acts as perceptual encoding)
+        // Apply full DNG pipeline: ForwardMatrix → ProPhoto → LookTable → ToneCurve → sRGB
+        // Output is display-referred — DCP tone curve IS the complete display encoding
         crate::color_pipeline::apply_dcp_pipeline(
             &mut rgb, width, height, profile, temperature,
         );

@@ -33,8 +33,9 @@ const XYZ_D50_TO_SRGB: [f64; 9] = [
 /// `profile`: parsed DCP profile
 /// `temperature`: estimated scene color temperature in Kelvin (for interpolation)
 ///
-/// **Output**: display-referred sRGB values (0.0–1.0). The DCP tone curve already
-/// produces perceptual output — do NOT apply sRGB gamma afterwards.
+/// **Output**: display-referred sRGB values (0.0–1.0).
+/// The DCP tone curve serves as the complete display encoding.
+/// Do NOT apply sRGB gamma afterwards.
 pub fn apply_dcp_pipeline(
     pixels: &mut [f32],
     width: usize,
@@ -69,34 +70,65 @@ pub fn apply_dcp_pipeline(
         let pg = (cam_to_prophoto[3] * r + cam_to_prophoto[4] * g + cam_to_prophoto[5] * b).max(0.0);
         let pb = (cam_to_prophoto[6] * r + cam_to_prophoto[7] * g + cam_to_prophoto[8] * b).max(0.0);
 
-        // ProPhoto RGB → HSV for LookTable application
-        let (mut h, mut s, mut v) = rgb_to_hsv(pr, pg, pb);
-
-        // Apply LookTable (3D LUT)
+        // Apply LookTable (encoding-dependent)
+        // When look_table_encoding=1, HSV is computed from sRGB gamma-encoded ProPhoto RGB.
+        // This changes the hue calculation — critical for correct yellow/orange rendering.
+        let (mut pr2, mut pg2, mut pb2) = (pr, pg, pb);
         if let (Some(ref dims), Some(ref data)) = (&profile.look_table_dims, &profile.look_table_data) {
-            apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
-        }
-
-        // Apply HueSatMap if present (interpolated for temperature)
-        if let Some(ref dims) = profile.hue_sat_map_dims {
-            let hsm_data = interpolate_hue_sat_map(profile, temperature);
-            if !hsm_data.is_empty() {
-                apply_hue_sat_map(dims, &hsm_data, &mut h, &mut s, &mut v);
+            if profile.look_table_encoding == 1 {
+                // sRGB encoding: gamma-encode → HSV → adjust → HSV→RGB → de-gamma
+                let pr_g = linear_to_srgb_f64(pr);
+                let pg_g = linear_to_srgb_f64(pg);
+                let pb_g = linear_to_srgb_f64(pb);
+                let (mut h, mut s, mut v) = rgb_to_hsv(pr_g, pg_g, pb_g);
+                apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
+                let (rg, gg, bg) = hsv_to_rgb(h, s, v);
+                pr2 = srgb_to_linear_f64(rg);
+                pg2 = srgb_to_linear_f64(gg);
+                pb2 = srgb_to_linear_f64(bg);
+            } else {
+                // Linear encoding: HSV from linear ProPhoto directly
+                let (mut h, mut s, mut v) = rgb_to_hsv(pr, pg, pb);
+                apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
+                let (r2, g2, b2) = hsv_to_rgb(h, s, v);
+                pr2 = r2; pg2 = g2; pb2 = b2;
             }
         }
 
-        // HSV → ProPhoto RGB (still linear)
-        let (pr2, pg2, pb2) = hsv_to_rgb(h, s, v);
+        // Apply HueSatMap if present (uses hue_sat_map_encoding, applied to linear ProPhoto)
+        if let Some(ref dims) = profile.hue_sat_map_dims {
+            let hsm_data = interpolate_hue_sat_map(profile, temperature);
+            if !hsm_data.is_empty() {
+                if profile.hue_sat_map_encoding == 1 {
+                    let pr_g = linear_to_srgb_f64(pr2);
+                    let pg_g = linear_to_srgb_f64(pg2);
+                    let pb_g = linear_to_srgb_f64(pb2);
+                    let (mut h, mut s, mut v) = rgb_to_hsv(pr_g, pg_g, pb_g);
+                    apply_hue_sat_map(dims, &hsm_data, &mut h, &mut s, &mut v);
+                    let (rg, gg, bg) = hsv_to_rgb(h, s, v);
+                    pr2 = srgb_to_linear_f64(rg);
+                    pg2 = srgb_to_linear_f64(gg);
+                    pb2 = srgb_to_linear_f64(bg);
+                } else {
+                    let (mut h, mut s, mut v) = rgb_to_hsv(pr2, pg2, pb2);
+                    apply_hue_sat_map(dims, &hsm_data, &mut h, &mut s, &mut v);
+                    let (r2, g2, b2) = hsv_to_rgb(h, s, v);
+                    pr2 = r2; pg2 = g2; pb2 = b2;
+                }
+            }
+        }
 
         // ProPhoto (linear) → sRGB (linear) via matrix
         // Must convert color space BEFORE applying nonlinear tone curve
-        // to avoid amplifying color differences through the matrix.
+        // because the matrix has negative coefficients that cause clipping on non-linear data.
         let sr = (prophoto_to_srgb[0] * pr2 + prophoto_to_srgb[1] * pg2 + prophoto_to_srgb[2] * pb2).max(0.0);
         let sg = (prophoto_to_srgb[3] * pr2 + prophoto_to_srgb[4] * pg2 + prophoto_to_srgb[5] * pb2).max(0.0);
         let sb = (prophoto_to_srgb[6] * pr2 + prophoto_to_srgb[7] * pg2 + prophoto_to_srgb[8] * pb2).max(0.0);
 
-        // Apply tone curve in sRGB space (produces display-referred output)
-        // The DCP tone curve acts as the perceptual encoding — no sRGB gamma needed after this.
+        // Apply tone curve in linear sRGB space → display-referred output.
+        // The DCP tone curve maps 0.18→0.44, serving as the complete display encoding
+        // (similar shape to sRGB gamma but with additional contrast/artistic intent).
+        // No sRGB gamma should be applied after this.
         pixels[idx] = apply_tone_curve(&tone_lut, sr).clamp(0.0, 1.0) as f32;
         pixels[idx + 1] = apply_tone_curve(&tone_lut, sg).clamp(0.0, 1.0) as f32;
         pixels[idx + 2] = apply_tone_curve(&tone_lut, sb).clamp(0.0, 1.0) as f32;
@@ -373,4 +405,24 @@ fn mat_mul_3x3(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
 
 fn identity_matrix() -> [f64; 9] {
     [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+/// sRGB gamma: linear → display-referred (f64)
+fn linear_to_srgb_f64(c: f64) -> f64 {
+    let c = c.max(0.0);
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Inverse sRGB gamma: display-referred → linear (f64)
+fn srgb_to_linear_f64(c: f64) -> f64 {
+    let c = c.max(0.0);
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
 }
