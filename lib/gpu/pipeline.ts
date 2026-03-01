@@ -1,0 +1,232 @@
+// lib/gpu/pipeline.ts
+// WebGPU compute pipeline for real-time image processing
+
+import type { ProcessingParams } from "../types";
+import processShaderSource from "./shaders/process.wgsl";
+
+export class ImageProcessor {
+    private device: GPUDevice;
+    private context: GPUCanvasContext;
+    private format: GPUTextureFormat;
+
+    private pipeline: GPUComputePipeline | null = null;
+    private inputBuffer: GPUBuffer | null = null;
+    private outputBuffer: GPUBuffer | null = null;
+    private paramsBuffer: GPUBuffer | null = null;
+    private readbackBuffer: GPUBuffer | null = null;
+    private bindGroup: GPUBindGroup | null = null;
+
+    private imageWidth = 0;
+    private imageHeight = 0;
+
+    constructor(
+        device: GPUDevice,
+        context: GPUCanvasContext,
+        format: GPUTextureFormat
+    ) {
+        this.device = device;
+        this.context = context;
+        this.format = format;
+    }
+
+    async init(): Promise<void> {
+        const shaderModule = this.device.createShaderModule({
+            label: "process-shader",
+            code: processShaderSource,
+        });
+
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            label: "process-bind-group-layout",
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "read-only-storage" },
+                },
+                {
+                    binding: 1,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "storage" },
+                },
+                {
+                    binding: 2,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "uniform" },
+                },
+            ],
+        });
+
+        this.pipeline = this.device.createComputePipeline({
+            label: "process-pipeline",
+            layout: this.device.createPipelineLayout({
+                bindGroupLayouts: [bindGroupLayout],
+            }),
+            compute: {
+                module: shaderModule,
+                entryPoint: "main",
+            },
+        });
+
+        // Create uniform buffer for params (12 floats = 48 bytes, aligned to 16)
+        this.paramsBuffer = this.device.createBuffer({
+            label: "params-buffer",
+            size: 48, // 12 * 4 bytes
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+    }
+
+    async uploadImage(
+        pixels: Float32Array,
+        width: number,
+        height: number
+    ): Promise<void> {
+        this.imageWidth = width;
+        this.imageHeight = height;
+
+        const pixelCount = width * height * 3;
+        const byteSize = pixelCount * 4;
+
+        // Create input buffer with the pixel data
+        this.inputBuffer = this.device.createBuffer({
+            label: "input-pixels",
+            size: byteSize,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this.device.queue.writeBuffer(this.inputBuffer, 0, pixels);
+
+        // Create output buffer
+        this.outputBuffer = this.device.createBuffer({
+            label: "output-pixels",
+            size: byteSize,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        });
+
+        // Create readback buffer (for rendering to canvas or export)
+        this.readbackBuffer = this.device.createBuffer({
+            label: "readback-buffer",
+            size: byteSize,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+
+        // Create bind group
+        this.bindGroup = this.device.createBindGroup({
+            label: "process-bind-group",
+            layout: this.pipeline!.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.inputBuffer } },
+                { binding: 1, resource: { buffer: this.outputBuffer } },
+                { binding: 2, resource: { buffer: this.paramsBuffer! } },
+            ],
+        });
+    }
+
+    async process(params: ProcessingParams): Promise<void> {
+        if (!this.pipeline || !this.bindGroup || !this.paramsBuffer) {
+            throw new Error("Pipeline not initialized or no image uploaded");
+        }
+
+        // Pack params into uniform buffer
+        // Struct layout: width(u32), height(u32), wb_r, wb_g, wb_b, exposure,
+        //                contrast, highlights, shadows, saturation, pad, pad
+        const paramsData = new ArrayBuffer(48);
+        const u32View = new Uint32Array(paramsData, 0, 2);
+        const f32View = new Float32Array(paramsData, 8, 10);
+
+        u32View[0] = this.imageWidth;
+        u32View[1] = this.imageHeight;
+        f32View[0] = params.whiteBalance[0]; // wb_r
+        f32View[1] = params.whiteBalance[1]; // wb_g
+        f32View[2] = params.whiteBalance[2]; // wb_b
+        f32View[3] = params.exposure;
+        f32View[4] = params.contrast / 100.0; // normalize to -1..1
+        f32View[5] = params.highlights / 100.0;
+        f32View[6] = params.shadows / 100.0;
+        f32View[7] = params.saturation / 100.0;
+        f32View[8] = 0; // padding
+        f32View[9] = 0; // padding
+
+        this.device.queue.writeBuffer(this.paramsBuffer, 0, paramsData);
+
+        // Dispatch compute shader
+        const encoder = this.device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.bindGroup);
+
+        const workgroupsX = Math.ceil(this.imageWidth / 16);
+        const workgroupsY = Math.ceil(this.imageHeight / 16);
+        pass.dispatchWorkgroups(workgroupsX, workgroupsY);
+        pass.end();
+
+        // Copy output to readback buffer
+        encoder.copyBufferToBuffer(
+            this.outputBuffer!,
+            0,
+            this.readbackBuffer!,
+            0,
+            this.imageWidth * this.imageHeight * 3 * 4
+        );
+
+        this.device.queue.submit([encoder.finish()]);
+    }
+
+    async render(canvas: HTMLCanvasElement): Promise<void> {
+        if (!this.readbackBuffer) return;
+
+        await this.readbackBuffer.mapAsync(GPUMapMode.READ);
+        const data = new Float32Array(this.readbackBuffer.getMappedRange().slice(0));
+        this.readbackBuffer.unmap();
+
+        // Convert f32 RGB to RGBA u8 for canvas
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+
+        canvas.width = this.imageWidth;
+        canvas.height = this.imageHeight;
+
+        const imageData = ctx.createImageData(this.imageWidth, this.imageHeight);
+        const pixels = imageData.data;
+
+        for (let i = 0; i < this.imageWidth * this.imageHeight; i++) {
+            const srcIdx = i * 3;
+            const dstIdx = i * 4;
+            pixels[dstIdx] = Math.round(data[srcIdx] * 255);       // R
+            pixels[dstIdx + 1] = Math.round(data[srcIdx + 1] * 255); // G
+            pixels[dstIdx + 2] = Math.round(data[srcIdx + 2] * 255); // B
+            pixels[dstIdx + 3] = 255;                                  // A
+        }
+
+        ctx.putImageData(imageData, 0, 0);
+    }
+
+    async readback(): Promise<Uint8ClampedArray> {
+        if (!this.readbackBuffer) throw new Error("No image processed");
+
+        await this.readbackBuffer.mapAsync(GPUMapMode.READ);
+        const data = new Float32Array(this.readbackBuffer.getMappedRange().slice(0));
+        this.readbackBuffer.unmap();
+
+        const result = new Uint8ClampedArray(this.imageWidth * this.imageHeight * 4);
+        for (let i = 0; i < this.imageWidth * this.imageHeight; i++) {
+            const srcIdx = i * 3;
+            const dstIdx = i * 4;
+            result[dstIdx] = Math.round(data[srcIdx] * 255);
+            result[dstIdx + 1] = Math.round(data[srcIdx + 1] * 255);
+            result[dstIdx + 2] = Math.round(data[srcIdx + 2] * 255);
+            result[dstIdx + 3] = 255;
+        }
+
+        return result;
+    }
+
+    getImageDimensions(): { width: number; height: number } {
+        return { width: this.imageWidth, height: this.imageHeight };
+    }
+
+    destroy(): void {
+        this.inputBuffer?.destroy();
+        this.outputBuffer?.destroy();
+        this.paramsBuffer?.destroy();
+        this.readbackBuffer?.destroy();
+    }
+}
