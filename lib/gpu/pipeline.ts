@@ -6,27 +6,20 @@ import processShaderSource from "./shaders/process.wgsl";
 
 export class ImageProcessor {
     private device: GPUDevice;
-    private context: GPUCanvasContext;
-    private format: GPUTextureFormat;
 
     private pipeline: GPUComputePipeline | null = null;
     private inputBuffer: GPUBuffer | null = null;
     private outputBuffer: GPUBuffer | null = null;
     private paramsBuffer: GPUBuffer | null = null;
-    private readbackBuffer: GPUBuffer | null = null;
     private bindGroup: GPUBindGroup | null = null;
 
     private imageWidth = 0;
     private imageHeight = 0;
+    private lastRenderedData: Float32Array | null = null;
+    private processing = false;
 
-    constructor(
-        device: GPUDevice,
-        context: GPUCanvasContext,
-        format: GPUTextureFormat
-    ) {
+    constructor(device: GPUDevice) {
         this.device = device;
-        this.context = context;
-        this.format = format;
     }
 
     async init(): Promise<void> {
@@ -101,13 +94,6 @@ export class ImageProcessor {
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
         });
 
-        // Create readback buffer (for rendering to canvas or export)
-        this.readbackBuffer = this.device.createBuffer({
-            label: "readback-buffer",
-            size: byteSize,
-            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-        });
-
         // Create bind group
         this.bindGroup = this.device.createBindGroup({
             label: "process-bind-group",
@@ -121,63 +107,72 @@ export class ImageProcessor {
     }
 
     async process(params: ProcessingParams): Promise<void> {
-        if (!this.pipeline || !this.bindGroup || !this.paramsBuffer) {
+        if (!this.pipeline || !this.bindGroup || !this.paramsBuffer || !this.outputBuffer) {
             throw new Error("Pipeline not initialized or no image uploaded");
         }
 
-        // Pack params into uniform buffer
-        // Struct layout: width(u32), height(u32), wb_r, wb_g, wb_b, exposure,
-        //                contrast, highlights, shadows, saturation, pad, pad
-        const paramsData = new ArrayBuffer(48);
-        const u32View = new Uint32Array(paramsData, 0, 2);
-        const f32View = new Float32Array(paramsData, 8, 10);
+        // Prevent concurrent processing — skip if already processing
+        if (this.processing) {
+            return;
+        }
+        this.processing = true;
 
-        u32View[0] = this.imageWidth;
-        u32View[1] = this.imageHeight;
-        f32View[0] = params.whiteBalance[0]; // wb_r
-        f32View[1] = params.whiteBalance[1]; // wb_g
-        f32View[2] = params.whiteBalance[2]; // wb_b
-        f32View[3] = params.exposure;
-        f32View[4] = params.contrast / 100.0; // normalize to -1..1
-        f32View[5] = params.highlights / 100.0;
-        f32View[6] = params.shadows / 100.0;
-        f32View[7] = params.saturation / 100.0;
-        f32View[8] = 0; // padding
-        f32View[9] = 0; // padding
+        try {
+            // Pack params into uniform buffer
+            const paramsData = new ArrayBuffer(48);
+            const u32View = new Uint32Array(paramsData, 0, 2);
+            const f32View = new Float32Array(paramsData, 8, 10);
 
-        this.device.queue.writeBuffer(this.paramsBuffer, 0, paramsData);
+            u32View[0] = this.imageWidth;
+            u32View[1] = this.imageHeight;
+            f32View[0] = params.whiteBalance[0]; // wb_r
+            f32View[1] = params.whiteBalance[1]; // wb_g
+            f32View[2] = params.whiteBalance[2]; // wb_b
+            f32View[3] = params.exposure;
+            f32View[4] = params.contrast / 100.0; // normalize to -1..1
+            f32View[5] = params.highlights / 100.0;
+            f32View[6] = params.shadows / 100.0;
+            f32View[7] = params.saturation / 100.0;
+            f32View[8] = 0; // padding
+            f32View[9] = 0; // padding
 
-        // Dispatch compute shader
-        const encoder = this.device.createCommandEncoder();
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(this.pipeline);
-        pass.setBindGroup(0, this.bindGroup);
+            this.device.queue.writeBuffer(this.paramsBuffer, 0, paramsData);
 
-        const workgroupsX = Math.ceil(this.imageWidth / 16);
-        const workgroupsY = Math.ceil(this.imageHeight / 16);
-        pass.dispatchWorkgroups(workgroupsX, workgroupsY);
-        pass.end();
+            // Dispatch compute shader
+            const encoder = this.device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(this.pipeline);
+            pass.setBindGroup(0, this.bindGroup);
 
-        // Copy output to readback buffer
-        encoder.copyBufferToBuffer(
-            this.outputBuffer!,
-            0,
-            this.readbackBuffer!,
-            0,
-            this.imageWidth * this.imageHeight * 3 * 4
-        );
+            const workgroupsX = Math.ceil(this.imageWidth / 16);
+            const workgroupsY = Math.ceil(this.imageHeight / 16);
+            pass.dispatchWorkgroups(workgroupsX, workgroupsY);
+            pass.end();
 
-        this.device.queue.submit([encoder.finish()]);
+            // Create a fresh readback buffer each time to avoid mapAsync conflicts
+            const byteSize = this.imageWidth * this.imageHeight * 3 * 4;
+            const readbackBuffer = this.device.createBuffer({
+                label: "readback-buffer",
+                size: byteSize,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            });
+
+            encoder.copyBufferToBuffer(this.outputBuffer, 0, readbackBuffer, 0, byteSize);
+            this.device.queue.submit([encoder.finish()]);
+
+            // Wait for GPU, then read
+            await readbackBuffer.mapAsync(GPUMapMode.READ);
+            this.lastRenderedData = new Float32Array(readbackBuffer.getMappedRange().slice(0));
+            readbackBuffer.unmap();
+            readbackBuffer.destroy();
+        } finally {
+            this.processing = false;
+        }
     }
 
-    async render(canvas: HTMLCanvasElement): Promise<void> {
-        if (!this.readbackBuffer) return;
+    render(canvas: HTMLCanvasElement): void {
+        if (!this.lastRenderedData) return;
 
-        await this.readbackBuffer.mapAsync(GPUMapMode.READ);
-        const data = new Float32Array(this.readbackBuffer.getMappedRange().slice(0));
-        this.readbackBuffer.unmap();
-
-        // Convert f32 RGB to RGBA u8 for canvas
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
 
@@ -186,33 +181,31 @@ export class ImageProcessor {
 
         const imageData = ctx.createImageData(this.imageWidth, this.imageHeight);
         const pixels = imageData.data;
+        const data = this.lastRenderedData;
 
         for (let i = 0; i < this.imageWidth * this.imageHeight; i++) {
             const srcIdx = i * 3;
             const dstIdx = i * 4;
-            pixels[dstIdx] = Math.round(data[srcIdx] * 255);       // R
-            pixels[dstIdx + 1] = Math.round(data[srcIdx + 1] * 255); // G
-            pixels[dstIdx + 2] = Math.round(data[srcIdx + 2] * 255); // B
-            pixels[dstIdx + 3] = 255;                                  // A
+            pixels[dstIdx] = Math.round(Math.min(255, Math.max(0, data[srcIdx] * 255)));         // R
+            pixels[dstIdx + 1] = Math.round(Math.min(255, Math.max(0, data[srcIdx + 1] * 255))); // G
+            pixels[dstIdx + 2] = Math.round(Math.min(255, Math.max(0, data[srcIdx + 2] * 255))); // B
+            pixels[dstIdx + 3] = 255;                                                              // A
         }
 
         ctx.putImageData(imageData, 0, 0);
     }
 
-    async readback(): Promise<Uint8ClampedArray> {
-        if (!this.readbackBuffer) throw new Error("No image processed");
+    readback(): Uint8ClampedArray {
+        if (!this.lastRenderedData) throw new Error("No image processed");
 
-        await this.readbackBuffer.mapAsync(GPUMapMode.READ);
-        const data = new Float32Array(this.readbackBuffer.getMappedRange().slice(0));
-        this.readbackBuffer.unmap();
-
+        const data = this.lastRenderedData;
         const result = new Uint8ClampedArray(this.imageWidth * this.imageHeight * 4);
         for (let i = 0; i < this.imageWidth * this.imageHeight; i++) {
             const srcIdx = i * 3;
             const dstIdx = i * 4;
-            result[dstIdx] = Math.round(data[srcIdx] * 255);
-            result[dstIdx + 1] = Math.round(data[srcIdx + 1] * 255);
-            result[dstIdx + 2] = Math.round(data[srcIdx + 2] * 255);
+            result[dstIdx] = Math.round(Math.min(255, Math.max(0, data[srcIdx] * 255)));
+            result[dstIdx + 1] = Math.round(Math.min(255, Math.max(0, data[srcIdx + 1] * 255)));
+            result[dstIdx + 2] = Math.round(Math.min(255, Math.max(0, data[srcIdx + 2] * 255)));
             result[dstIdx + 3] = 255;
         }
 
@@ -227,6 +220,6 @@ export class ImageProcessor {
         this.inputBuffer?.destroy();
         this.outputBuffer?.destroy();
         this.paramsBuffer?.destroy();
-        this.readbackBuffer?.destroy();
+        this.lastRenderedData = null;
     }
 }

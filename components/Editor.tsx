@@ -4,7 +4,7 @@ import React, { useState, useCallback, useRef, useEffect } from "react";
 import type { ProcessingParams, DecodedImage, RawMetadata } from "@/lib/types";
 import { DEFAULT_PARAMS } from "@/lib/types";
 import { decodeRaw } from "@/lib/wasm";
-import { initGPU, isWebGPUAvailable } from "@/lib/gpu/device";
+import { initGPUDevice, isWebGPUAvailable } from "@/lib/gpu/device";
 import { ImageProcessor } from "@/lib/gpu/pipeline";
 import FileDropZone from "./FileDropZone";
 import Controls from "./Controls";
@@ -21,6 +21,7 @@ export default function Editor() {
     const [gpuAvailable, setGpuAvailable] = useState<boolean | null>(null);
     const [fileName, setFileName] = useState<string>("");
 
+    // Single canvas ref — always mounted (hidden when not in use)
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const processorRef = useRef<ImageProcessor | null>(null);
     const decodedImageRef = useRef<DecodedImage | null>(null);
@@ -39,10 +40,9 @@ export default function Editor() {
 
         try {
             await processor.process(newParams);
-            await processor.render(canvas);
+            processor.render(canvas);
 
-            // Update histogram (debounced)
-            const data = await processor.readback();
+            const data = processor.readback();
             setHistogramData(data);
         } catch (e) {
             console.error("Processing error:", e);
@@ -76,54 +76,66 @@ export default function Editor() {
             const arrayBuffer = await file.arrayBuffer();
 
             // Decode RAW via WASM
+            console.log("[RAW Processor] Decoding RAW file...");
             const decoded = await decodeRaw(arrayBuffer);
+            console.log(`[RAW Processor] Decoded: ${decoded.width}x${decoded.height}, pixels: ${decoded.pixels.length}`);
+            console.log("[RAW Processor] Metadata:", JSON.stringify(decoded.metadata, null, 2));
+            console.log("[RAW Processor] WB coeffs:", decoded.metadata.wb_coeffs);
+            console.log("[RAW Processor] CFA pattern:", decoded.metadata.cfa_pattern);
+            console.log("[RAW Processor] xyz_to_cam (raw):", decoded.metadata.xyz_to_cam_raw);
+            console.log("[RAW Processor] cam_to_srgb (computed):", decoded.metadata.color_matrix);
+            console.log("[RAW Processor] First 12 pixel values (4 pixels RGB):",
+                Array.from(decoded.pixels.slice(0, 12)).map(v => v.toFixed(4)));
             decodedImageRef.current = decoded;
 
             // Set up initial WB from camera metadata
+            // Camera WB is already applied pre-demosaic in Rust.
+            // GPU shader WB starts at identity; user adjusts via temperature/tint sliders.
             const initialParams: ProcessingParams = {
                 ...DEFAULT_PARAMS,
-                whiteBalance: [
-                    decoded.metadata.wb_coeffs[0] / decoded.metadata.wb_coeffs[1],
-                    1.0,
-                    decoded.metadata.wb_coeffs[2] / decoded.metadata.wb_coeffs[1],
-                ],
+                whiteBalance: [1.0, 1.0, 1.0],
             };
 
             setMetadata(decoded.metadata);
             setParams(initialParams);
 
-            // Initialize WebGPU
-            const canvas = canvasRef.current;
-            if (!canvas) throw new Error("Canvas not found");
-
-            const gpuCtx = await initGPU(canvas);
-            if (!gpuCtx) {
+            // Initialize WebGPU (device only — no canvas context needed for compute)
+            console.log("[RAW Processor] Initializing WebGPU...");
+            const device = await initGPUDevice();
+            if (!device) {
                 throw new Error("WebGPU initialization failed. Please use Chrome or Edge.");
             }
 
             // Create processor
-            const processor = new ImageProcessor(gpuCtx.device, gpuCtx.context, gpuCtx.format);
+            const processor = new ImageProcessor(device);
             await processor.init();
+            console.log("[RAW Processor] Uploading image to GPU...");
             await processor.uploadImage(decoded.pixels, decoded.width, decoded.height);
 
             // Clean up previous processor
             processorRef.current?.destroy();
             processorRef.current = processor;
 
-            // Initial processing
+            // Process the image
+            console.log("[RAW Processor] Processing...");
             setStatus("processing");
             await processor.process(initialParams);
-            await processor.render(canvas);
 
-            const histData = await processor.readback();
-            setHistogramData(histData);
+            // Render to canvas (canvas ref is always mounted)
+            const canvas = canvasRef.current;
+            if (canvas) {
+                processor.render(canvas);
+                const histData = processor.readback();
+                setHistogramData(histData);
+            }
 
+            console.log("[RAW Processor] Ready!");
             setStatus("ready");
         } catch (e) {
             const message = e instanceof Error ? e.message : String(e);
             setError(message);
             setStatus("error");
-            console.error("Error:", e);
+            console.error("[RAW Processor] Error:", e);
         }
     }, []);
 
@@ -156,11 +168,7 @@ export default function Editor() {
 
         const resetParams: ProcessingParams = {
             ...DEFAULT_PARAMS,
-            whiteBalance: [
-                decoded.metadata.wb_coeffs[0] / decoded.metadata.wb_coeffs[1],
-                1.0,
-                decoded.metadata.wb_coeffs[2] / decoded.metadata.wb_coeffs[1],
-            ],
+            whiteBalance: [1.0, 1.0, 1.0],
         };
         setParams(resetParams);
         processImage(resetParams);
@@ -172,6 +180,8 @@ export default function Editor() {
             processorRef.current?.destroy();
         };
     }, []);
+
+    const hasImage = status !== "idle" && status !== "loading";
 
     return (
         <div className="editor">
@@ -201,32 +211,37 @@ export default function Editor() {
             <div className="editor__body">
                 {/* Canvas area */}
                 <div className="editor__canvas-area">
-                    {status === "idle" ? (
+                    {status === "idle" && (
                         <FileDropZone onFileSelected={handleFileSelected} isLoading={false} />
-                    ) : status === "loading" ? (
+                    )}
+                    {status === "loading" && (
                         <FileDropZone onFileSelected={handleFileSelected} isLoading={true} />
-                    ) : (
-                        <>
-                            <div className="editor__canvas-wrapper">
-                                <canvas ref={canvasRef} className="editor__canvas" />
-                            </div>
-                            {/* File re-upload */}
-                            <div className="editor__canvas-toolbar">
-                                <label className="editor__reopen-btn" htmlFor="file-reopen">
-                                    別のファイルを開く
-                                </label>
-                                <input
-                                    id="file-reopen"
-                                    type="file"
-                                    accept=".cr2,.cr3,.nef,.nrw,.arw,.srf,.raf,.orf,.rw2,.dng,.pef,.raw"
-                                    onChange={(e) => {
-                                        const f = e.target.files?.[0];
-                                        if (f) handleFileSelected(f);
-                                    }}
-                                    style={{ display: "none" }}
-                                />
-                            </div>
-                        </>
+                    )}
+
+                    {/* Canvas is always in the DOM but hidden when not needed */}
+                    <div
+                        className="editor__canvas-wrapper"
+                        style={{ display: hasImage ? "flex" : "none" }}
+                    >
+                        <canvas ref={canvasRef} className="editor__canvas" />
+                    </div>
+
+                    {hasImage && (
+                        <div className="editor__canvas-toolbar">
+                            <label className="editor__reopen-btn" htmlFor="file-reopen">
+                                別のファイルを開く
+                            </label>
+                            <input
+                                id="file-reopen"
+                                type="file"
+                                accept=".cr2,.cr3,.nef,.nrw,.arw,.srf,.raf,.orf,.rw2,.dng,.pef,.raw"
+                                onChange={(e) => {
+                                    const f = e.target.files?.[0];
+                                    if (f) handleFileSelected(f);
+                                }}
+                                style={{ display: "none" }}
+                            />
+                        </div>
                     )}
 
                     {status === "error" && (
@@ -237,7 +252,7 @@ export default function Editor() {
                     )}
                 </div>
 
-                {/* Controls panel (visible only when image loaded) */}
+                {/* Controls panel */}
                 {(status === "ready" || status === "processing") && (
                     <aside className="editor__sidebar">
                         <Controls
@@ -255,11 +270,6 @@ export default function Editor() {
                     </aside>
                 )}
             </div>
-
-            {/* Hidden canvas for WebGPU (used when idle/loading too) */}
-            {status === "idle" || status === "loading" ? (
-                <canvas ref={canvasRef} style={{ display: "none" }} />
-            ) : null}
         </div>
     );
 }

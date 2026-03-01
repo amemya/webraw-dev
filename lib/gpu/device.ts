@@ -1,12 +1,6 @@
 // lib/gpu/device.ts
 // WebGPU device initialization and capability detection
 
-export interface GPUContext {
-    device: GPUDevice;
-    context: GPUCanvasContext;
-    format: GPUTextureFormat;
-}
-
 export async function isWebGPUAvailable(): Promise<boolean> {
     if (!navigator.gpu) return false;
     try {
@@ -17,7 +11,7 @@ export async function isWebGPUAvailable(): Promise<boolean> {
     }
 }
 
-export async function initGPU(canvas: HTMLCanvasElement): Promise<GPUContext | null> {
+export async function initGPUDevice(): Promise<GPUDevice | null> {
     if (!navigator.gpu) {
         console.warn("WebGPU is not supported in this browser");
         return null;
@@ -40,22 +34,9 @@ export async function initGPU(canvas: HTMLCanvasElement): Promise<GPUContext | n
         },
     });
 
-    device.lost.then((info) => {
+    device.lost.then((info: GPUDeviceLostInfo) => {
         console.error("WebGPU device lost:", info.message);
     });
 
-    const context = canvas.getContext("webgpu");
-    if (!context) {
-        console.warn("Failed to get WebGPU context");
-        return null;
-    }
-
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    context.configure({
-        device,
-        format,
-        alphaMode: "premultiplied",
-    });
-
-    return { device, context, format };
+    return device;
 }

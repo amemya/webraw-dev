@@ -1,5 +1,7 @@
-mod decode;
-mod demosaic;
+pub mod decode;
+pub mod demosaic;
+pub mod dcp;
+pub mod color_pipeline;
 
 use wasm_bindgen::prelude::*;
 
@@ -34,6 +36,10 @@ pub fn decode_raw(data: &[u8]) -> Result<JsValue, JsError> {
         .map_err(|e| JsError::new(&format!("Serialization error: {}", e)))?;
     js_sys::Reflect::set(&obj, &"metadata".into(), &metadata)
         .map_err(|_| JsError::new("Failed to set metadata"))?;
+
+    // Set display_referred flag (true = DCP tone curve applied, skip sRGB gamma)
+    js_sys::Reflect::set(&obj, &"displayReferred".into(), &JsValue::from_bool(result.display_referred))
+        .map_err(|_| JsError::new("Failed to set displayReferred"))?;
 
     Ok(obj.into())
 }
