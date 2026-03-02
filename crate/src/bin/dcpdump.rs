@@ -67,6 +67,10 @@ fn main() {
         println!("LookTableData: {} entries", data.len());
     }
 
+    if let Some(be) = profile.baseline_exposure_offset {
+        println!("\nBaselineExposureOffset: {:.4} EV", be);
+    }
+
     if let Some(ref curve) = profile.tone_curve {
         println!("\nToneCurve: {} points", curve.len());
         // Show first few and last

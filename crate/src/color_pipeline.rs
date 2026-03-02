@@ -74,28 +74,8 @@ pub fn apply_dcp_pipeline(
         // When look_table_encoding=1, HSV is computed from sRGB gamma-encoded ProPhoto RGB.
         // This changes the hue calculation — critical for correct yellow/orange rendering.
         let (mut pr2, mut pg2, mut pb2) = (pr, pg, pb);
-        if let (Some(ref dims), Some(ref data)) = (&profile.look_table_dims, &profile.look_table_data) {
-            if profile.look_table_encoding == 1 {
-                // sRGB encoding: gamma-encode → HSV → adjust → HSV→RGB → de-gamma
-                let pr_g = linear_to_srgb_f64(pr);
-                let pg_g = linear_to_srgb_f64(pg);
-                let pb_g = linear_to_srgb_f64(pb);
-                let (mut h, mut s, mut v) = rgb_to_hsv(pr_g, pg_g, pb_g);
-                apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
-                let (rg, gg, bg) = hsv_to_rgb(h, s, v);
-                pr2 = srgb_to_linear_f64(rg);
-                pg2 = srgb_to_linear_f64(gg);
-                pb2 = srgb_to_linear_f64(bg);
-            } else {
-                // Linear encoding: HSV from linear ProPhoto directly
-                let (mut h, mut s, mut v) = rgb_to_hsv(pr, pg, pb);
-                apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
-                let (r2, g2, b2) = hsv_to_rgb(h, s, v);
-                pr2 = r2; pg2 = g2; pb2 = b2;
-            }
-        }
 
-        // Apply HueSatMap if present (uses hue_sat_map_encoding, applied to linear ProPhoto)
+        // 1. Apply HueSatMap FIRST (uses hue_sat_map_encoding, applied to linear ProPhoto)
         if let Some(ref dims) = profile.hue_sat_map_dims {
             let hsm_data = interpolate_hue_sat_map(profile, temperature);
             if !hsm_data.is_empty() {
@@ -118,20 +98,52 @@ pub fn apply_dcp_pipeline(
             }
         }
 
-        // ProPhoto (linear) → sRGB (linear) via matrix
-        // Must convert color space BEFORE applying nonlinear tone curve
-        // because the matrix has negative coefficients that cause clipping on non-linear data.
-        let sr = (prophoto_to_srgb[0] * pr2 + prophoto_to_srgb[1] * pg2 + prophoto_to_srgb[2] * pb2).max(0.0);
-        let sg = (prophoto_to_srgb[3] * pr2 + prophoto_to_srgb[4] * pg2 + prophoto_to_srgb[5] * pb2).max(0.0);
-        let sb = (prophoto_to_srgb[6] * pr2 + prophoto_to_srgb[7] * pg2 + prophoto_to_srgb[8] * pb2).max(0.0);
+        // 2. Apply LookTable SECOND (encoding-dependent)
+        if let (Some(ref dims), Some(ref data)) = (&profile.look_table_dims, &profile.look_table_data) {
+            if profile.look_table_encoding == 1 {
+                // sRGB encoding: gamma-encode → HSV → adjust → HSV→RGB → de-gamma
+                let pr_g = linear_to_srgb_f64(pr2);
+                let pg_g = linear_to_srgb_f64(pg2);
+                let pb_g = linear_to_srgb_f64(pb2);
+                let (mut h, mut s, mut v) = rgb_to_hsv(pr_g, pg_g, pb_g);
+                apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
+                let (rg, gg, bg) = hsv_to_rgb(h, s, v);
+                pr2 = srgb_to_linear_f64(rg);
+                pg2 = srgb_to_linear_f64(gg);
+                pb2 = srgb_to_linear_f64(bg);
+            } else {
+                // Linear encoding: HSV from linear ProPhoto directly
+                let (mut h, mut s, mut v) = rgb_to_hsv(pr2, pg2, pb2);
+                apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
+                let (r2, g2, b2) = hsv_to_rgb(h, s, v);
+                pr2 = r2; pg2 = g2; pb2 = b2;
+            }
+        }
 
-        // Apply tone curve in linear sRGB space → display-referred output.
-        // The DCP tone curve maps 0.18→0.44, serving as the complete display encoding
-        // (similar shape to sRGB gamma but with additional contrast/artistic intent).
-        // No sRGB gamma should be applied after this.
-        pixels[idx] = apply_tone_curve(&tone_lut, sr).clamp(0.0, 1.0) as f32;
-        pixels[idx + 1] = apply_tone_curve(&tone_lut, sg).clamp(0.0, 1.0) as f32;
-        pixels[idx + 2] = apply_tone_curve(&tone_lut, sb).clamp(0.0, 1.0) as f32;
+        // 3. Apply Tone Curve to Linear ProPhoto RGB independently
+        // Do not clamp the output, allowing highlights to stay > 1.0 (requires extrapolated lut)
+        let pr3 = apply_tone_curve(&tone_lut, pr2);
+        let pg3 = apply_tone_curve(&tone_lut, pg2);
+        let pb3 = apply_tone_curve(&tone_lut, pb2);
+
+        // 4. Decode Melissa RGB (sRGB gamma) to get back to Linear ProPhoto Space
+        // Note: DNG specification defines Tone Curve output as having an sRGB gamma
+        let pr_lin = srgb_to_linear_f64(pr3);
+        let pg_lin = srgb_to_linear_f64(pg3);
+        let pb_lin = srgb_to_linear_f64(pb3);
+
+        // 5. Apply ProPhoto → sRGB (linear) matrix
+        let sr = (prophoto_to_srgb[0] * pr_lin + prophoto_to_srgb[1] * pg_lin + prophoto_to_srgb[2] * pb_lin).max(0.0);
+        let sg = (prophoto_to_srgb[3] * pr_lin + prophoto_to_srgb[4] * pg_lin + prophoto_to_srgb[5] * pb_lin).max(0.0);
+        let sb = (prophoto_to_srgb[6] * pr_lin + prophoto_to_srgb[7] * pg_lin + prophoto_to_srgb[8] * pb_lin).max(0.0);
+
+        // 6. Output Linear sRGB
+        // We do *not* apply sRGB gamma here because the pipeline expects linear sRGB
+        // so that subsequent filters (exposure, contrast) and final gamma encoding
+        // can be properly applied by the WebGPU shader or raw2ppm tool.
+        pixels[idx] = sr as f32;
+        pixels[idx + 1] = sg as f32;
+        pixels[idx + 2] = sb as f32;
     }
 }
 
@@ -244,9 +256,11 @@ fn apply_hue_sat_map(
     // Trilinear interpolation
     let sd = dims.sat_divs as usize;
     let vd = dims.val_divs as usize;
+    let hd = dims.hue_divs as usize; // Added Hue multiplier
 
     let entry_at = |hi: usize, si: usize, vi: usize| -> &HueSatMapEntry {
-        let idx = (hi * sd + si) * vd + vi;
+        // DNG Spec 1.4: "Value-major, Saturation-minor, Hue-micro"
+        let idx = (vi * sd + si) * hd + hi;
         &data[idx.min(data.len() - 1)]
     };
 
@@ -334,7 +348,20 @@ fn build_tone_lut(profile: &DcpProfile) -> Vec<f64> {
 /// Apply tone curve via LUT lookup
 fn apply_tone_curve(lut: &[f64], value: f64) -> f64 {
     if lut.is_empty() { return value; }
-    let idx_f = (value.clamp(0.0, 1.0) * (lut.len() - 1) as f64);
+    
+    if value <= 0.0 {
+        return value;
+    }
+    
+    if value >= 1.0 {
+        let last_idx = lut.len() - 1;
+        let dy = lut[last_idx] - lut[last_idx - 1];
+        let dx = 1.0 / (lut.len() - 1) as f64;
+        let slope = dy / dx;
+        return lut[last_idx] + (value - 1.0) * slope;
+    }
+
+    let idx_f = value * (lut.len() - 1) as f64;
     let idx0 = idx_f.floor() as usize;
     let idx1 = (idx0 + 1).min(lut.len() - 1);
     let frac = idx_f - idx0 as f64;

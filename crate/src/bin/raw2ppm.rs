@@ -52,15 +52,32 @@ fn write_ppm(path: &str, pixels: &[f32], w: usize, h: usize, display_referred: b
     for i in 0..(w * h) {
         let idx = i * 3;
         if display_referred {
-            // DCP output: already display-referred, just scale to 0-255
-            ppm.push(to_u8(pixels[idx]));
-            ppm.push(to_u8(pixels[idx + 1]));
-            ppm.push(to_u8(pixels[idx + 2]));
+            let mut r = pixels[idx];
+            let mut g = pixels[idx + 1];
+            let mut b = pixels[idx + 2];
+            let max_c = r.max(g).max(b);
+            if max_c > 1.0 {
+                r /= max_c;
+                g /= max_c;
+                b /= max_c;
+            }
+            ppm.push(to_u8(r));
+            ppm.push(to_u8(g));
+            ppm.push(to_u8(b));
         } else {
-            // Linear data: apply sRGB gamma
-            ppm.push(to_u8(linear_to_srgb(pixels[idx])));
-            ppm.push(to_u8(linear_to_srgb(pixels[idx + 1])));
-            ppm.push(to_u8(linear_to_srgb(pixels[idx + 2])));
+            // Linear data: apply simple tone mapping and sRGB gamma
+            let mut r = pixels[idx];
+            let mut g = pixels[idx + 1];
+            let mut b = pixels[idx + 2];
+            let max_c = r.max(g).max(b);
+            if max_c > 1.0 {
+                r /= max_c;
+                g /= max_c;
+                b /= max_c;
+            }
+            ppm.push(to_u8(linear_to_srgb(r)));
+            ppm.push(to_u8(linear_to_srgb(g)));
+            ppm.push(to_u8(linear_to_srgb(b)));
         }
     }
     fs::write(path, &ppm).expect("Failed to write PPM");

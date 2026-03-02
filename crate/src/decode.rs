@@ -90,6 +90,44 @@ pub fn decode_raw_bytes(data: &[u8]) -> Result<DecodeResult, String> {
     // Demosaic (data is cropped and white-balanced)
     let mut rgb = demosaic::demosaic_bilinear(&normalized, width, height, &cfa_pattern);
 
+    // Highlight Desaturation: Blend clipped regions towards neutral white
+    // This prevents "magenta highlights" caused by channel clipping before WB.
+    let mut wb_r = wb_coeffs[0];
+    let mut wb_g = (wb_coeffs[1] + wb_coeffs[3]) / 2.0;
+    if wb_g.is_nan() || wb_g == 0.0 { wb_g = wb_coeffs[1]; }
+    let mut wb_b = wb_coeffs[2];
+    
+    let min_wb = wb_r.min(wb_g).min(wb_b);
+    if min_wb > 0.0 {
+        wb_r /= min_wb;
+        wb_g /= min_wb;
+        wb_b /= min_wb;
+    }
+
+    let blend_start = 0.85;
+    for i in 0..(width * height) {
+        let idx = i * 3;
+        let r = rgb[idx];
+        let g = rgb[idx + 1];
+        let b = rgb[idx + 2];
+
+        // Reconstruct approximate sensor RAW values (0.0 to ~1.0)
+        let raw_r = r / wb_r;
+        let raw_g = g / wb_g;
+        let raw_b = b / wb_b;
+        let max_raw = raw_r.max(raw_g).max(raw_b);
+
+        if max_raw > blend_start {
+            let t = ((max_raw - blend_start) / (1.0 - blend_start)).min(1.0);
+            let t_smooth = t * t * (3.0 - 2.0 * t);
+            let max_rgb = r.max(g).max(b);
+            
+            rgb[idx] = r * (1.0 - t_smooth) + max_rgb * t_smooth;
+            rgb[idx + 1] = g * (1.0 - t_smooth) + max_rgb * t_smooth;
+            rgb[idx + 2] = b * (1.0 - t_smooth) + max_rgb * t_smooth;
+        }
+    }
+
     // Try to load bundled DCP profile and apply DNG color pipeline
     let dcp_profile = load_bundled_dcp(&raw_image.make, &raw_image.model);
     let (color_matrix, display_referred) = if let Some(ref profile) = dcp_profile {
@@ -106,7 +144,9 @@ pub fn decode_raw_bytes(data: &[u8]) -> Result<DecodeResult, String> {
         let matrix: Vec<f32> = profile.forward_matrix_2
             .unwrap_or(profile.forward_matrix_1.unwrap_or([0.0; 9]))
             .iter().map(|&x| x as f32).collect();
-        (matrix, true)
+        // Since we explicitly leave colors in Linear sRGB space,
+        // we flag display_referred as false so gamma is correctly applied later.
+        (matrix, false)
     } else {
         // Fallback: simple matrix approach — output is linear, needs sRGB gamma
         let (_, cam_to_srgb) = compute_wb_and_matrix_fallback(&raw_image, &cfa_pattern);
@@ -323,8 +363,8 @@ fn normalize_crop_and_wb(
                     let wb = wb_mults[cfa_idx];
 
                     let raw_val = data[idx] as f32;
-                    let norm = ((raw_val - black) / (white - black)) * wb;
-                    normalized.push(norm.max(0.0));
+                    let norm = ((raw_val - black) / (white - black)).max(0.0);
+                    normalized.push(norm * wb);
                 }
             }
             Ok(normalized)

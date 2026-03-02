@@ -25,6 +25,7 @@ const TAG_PROFILE_LOOK_TABLE_DATA: u16 = 50982;
 const TAG_PROFILE_NAME: u16 = 50936;
 const TAG_PROFILE_HUE_SAT_MAP_ENCODING: u16 = 51107;
 const TAG_PROFILE_LOOK_TABLE_ENCODING: u16 = 51108;
+const TAG_BASELINE_EXPOSURE_OFFSET: u16 = 50935; // C6F7 (BaselineExposureOffset in DCP)
 
 /// TIFF type IDs
 const TYPE_SHORT: u16 = 3;  // u16
@@ -120,6 +121,9 @@ pub struct DcpProfile {
 
     /// Tone curve as (input, output) pairs
     pub tone_curve: Option<Vec<(f32, f32)>>,
+
+    /// Baseline exposure offset (in EV)
+    pub baseline_exposure_offset: Option<f64>,
 }
 
 impl Default for DcpProfile {
@@ -140,6 +144,7 @@ impl Default for DcpProfile {
             look_table_data: None,
             look_table_encoding: 0,
             tone_curve: None,
+            baseline_exposure_offset: None,
         }
     }
 }
@@ -254,6 +259,9 @@ fn parse_ifd(data: &[u8], offset: usize, le: bool, profile: &mut DcpProfile) -> 
             }
             TAG_PROFILE_TONE_CURVE => {
                 profile.tone_curve = Some(read_tone_curve(data, value_ptr, typ, count, le));
+            }
+            TAG_BASELINE_EXPOSURE_OFFSET => {
+                profile.baseline_exposure_offset = Some(read_srational(data, value_ptr, le));
             }
             _ => {} // ignore unknown tags
         }

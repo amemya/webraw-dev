@@ -99,7 +99,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   g = g * exp_mul;
   b = b * exp_mul;
 
-  // 3. Clamp after exposure
+  // 3. Highlight preservation after exposure
+  // Instead of independent clamping which destroys hues, scale brightness to fit
+  let max_c = max(r, max(g, b));
+  if (max_c > 1.0) {
+      r = r / max_c;
+      g = g / max_c;
+      b = b / max_c;
+  }
+  
+  // Minor clamp to fix any absolute lower bound issues or floating point drift
   r = clamp(r, 0.0, 1.0);
   g = clamp(g, 0.0, 1.0);
   b = clamp(b, 0.0, 1.0);
