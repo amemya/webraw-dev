@@ -56,25 +56,34 @@ fn write_ppm(path: &str, pixels: &[f32], w: usize, h: usize, display_referred: b
             let mut g = pixels[idx + 1];
             let mut b = pixels[idx + 2];
             let max_c = r.max(g).max(b);
-            if max_c > 1.0 {
-                r /= max_c;
-                g /= max_c;
-                b /= max_c;
-            }
+                let desat_start = 0.85;
+                let desat_end = 2.0;
+                if max_c > desat_start {
+                    let mut blend = ((max_c - desat_start) / (desat_end - desat_start)).clamp(0.0, 1.0);
+                    blend = blend * blend * (3.0 - 2.0 * blend);
+                    r = r * (1.0 - blend) + 1.0 * blend;
+                    g = g * (1.0 - blend) + 1.0 * blend;
+                    b = b * (1.0 - blend) + 1.0 * blend;
+                }
+            // clamp for safety
+            r = r.clamp(0.0, 1.0);
+            g = g.clamp(0.0, 1.0);
+            b = b.clamp(0.0, 1.0);
+            
             ppm.push(to_u8(r));
             ppm.push(to_u8(g));
             ppm.push(to_u8(b));
         } else {
-            // Linear data: apply simple tone mapping and sRGB gamma
+            // Linear data: apply sRGB gamma
             let mut r = pixels[idx];
             let mut g = pixels[idx + 1];
             let mut b = pixels[idx + 2];
-            let max_c = r.max(g).max(b);
-            if max_c > 1.0 {
-                r /= max_c;
-                g /= max_c;
-                b /= max_c;
-            }
+
+            
+            r = r.clamp(0.0, 1.0);
+            g = g.clamp(0.0, 1.0);
+            b = b.clamp(0.0, 1.0);
+            
             ppm.push(to_u8(linear_to_srgb(r)));
             ppm.push(to_u8(linear_to_srgb(g)));
             ppm.push(to_u8(linear_to_srgb(b)));

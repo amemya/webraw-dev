@@ -21,6 +21,8 @@ pub struct RawMetadata {
     pub cfa_pattern: String,
     /// Camera-to-sRGB color matrix (flattened 3x3, row-major)
     pub color_matrix: Vec<f32>,
+    /// DCP Tone Curve interpolated LUT (e.g. 4096 elements). Empty if no tone curve.
+    pub tone_curve: Vec<f32>,
     /// Raw xyz_to_cam matrix from rawloader (for debugging)
     pub xyz_to_cam_raw: Vec<f32>,
 }
@@ -90,8 +92,6 @@ pub fn decode_raw_bytes(data: &[u8]) -> Result<DecodeResult, String> {
     // Demosaic (data is cropped and white-balanced)
     let mut rgb = demosaic::demosaic_bilinear(&normalized, width, height, &cfa_pattern);
 
-    // Highlight Desaturation: Blend clipped regions towards neutral white
-    // This prevents "magenta highlights" caused by channel clipping before WB.
     let mut wb_r = wb_coeffs[0];
     let mut wb_g = (wb_coeffs[1] + wb_coeffs[3]) / 2.0;
     if wb_g.is_nan() || wb_g == 0.0 { wb_g = wb_coeffs[1]; }
@@ -104,54 +104,42 @@ pub fn decode_raw_bytes(data: &[u8]) -> Result<DecodeResult, String> {
         wb_b /= min_wb;
     }
 
-    let blend_start = 0.85;
+    // Apply WB *after* demosaic to avoid corrupting spatial gradients
     for i in 0..(width * height) {
         let idx = i * 3;
-        let r = rgb[idx];
-        let g = rgb[idx + 1];
-        let b = rgb[idx + 2];
-
-        // Reconstruct approximate sensor RAW values (0.0 to ~1.0)
-        let raw_r = r / wb_r;
-        let raw_g = g / wb_g;
-        let raw_b = b / wb_b;
-        let max_raw = raw_r.max(raw_g).max(raw_b);
-
-        if max_raw > blend_start {
-            let t = ((max_raw - blend_start) / (1.0 - blend_start)).min(1.0);
-            let t_smooth = t * t * (3.0 - 2.0 * t);
-            let max_rgb = r.max(g).max(b);
-            
-            rgb[idx] = r * (1.0 - t_smooth) + max_rgb * t_smooth;
-            rgb[idx + 1] = g * (1.0 - t_smooth) + max_rgb * t_smooth;
-            rgb[idx + 2] = b * (1.0 - t_smooth) + max_rgb * t_smooth;
-        }
+        rgb[idx] *= wb_r;
+        rgb[idx + 1] *= wb_g;
+        rgb[idx + 2] *= wb_b;
     }
 
     // Try to load bundled DCP profile and apply DNG color pipeline
     let dcp_profile = load_bundled_dcp(&raw_image.make, &raw_image.model);
-    let (color_matrix, display_referred) = if let Some(ref profile) = dcp_profile {
+    let (color_matrix, tone_curve, display_referred) = if let Some(ref profile) = dcp_profile {
         // Estimate color temperature from WB coefficients
         let temperature = estimate_color_temperature(&wb_coeffs);
 
-        // Apply full DNG pipeline: ForwardMatrix → ProPhoto → LookTable → ToneCurve → sRGB
-        // Output is display-referred — DCP tone curve IS the complete display encoding
+        // Apply DNG pipeline up to linear ProPhoto, and convert back to linear sRGB
+        // Output is NOT display-referred — the shader will apply the Tone Curve
         crate::color_pipeline::apply_dcp_pipeline(
-            &mut rgb, width, height, profile, temperature,
+            &mut rgb, width, height, profile, temperature, &[wb_r, wb_g, wb_b],
         );
 
-        // Return ForwardMatrix as debug info
+        // Extract ForwardMatrix as debug info
         let matrix: Vec<f32> = profile.forward_matrix_2
             .unwrap_or(profile.forward_matrix_1.unwrap_or([0.0; 9]))
             .iter().map(|&x| x as f32).collect();
-        // Since we explicitly leave colors in Linear sRGB space,
-        // we flag display_referred as false so gamma is correctly applied later.
-        (matrix, false)
+            
+        // Extract Tone Curve LUT to send to WebGPU
+        let curve_lut = crate::color_pipeline::build_tone_lut_f32(profile);
+
+        // Since we explicitly leave colors in Linear sRGB space now and pass the Tone Curve to JS,
+        // we flag display_referred as false so gamma/exposure is correctly applied later.
+        (matrix, curve_lut, false)
     } else {
         // Fallback: simple matrix approach — output is linear, needs sRGB gamma
         let (_, cam_to_srgb) = compute_wb_and_matrix_fallback(&raw_image, &cfa_pattern);
         apply_color_matrix(&mut rgb, width, height, &cam_to_srgb);
-        (cam_to_srgb.to_vec(), false)
+        (cam_to_srgb.to_vec(), Vec::new(), false)
     };
 
     let metadata = RawMetadata {
@@ -164,6 +152,7 @@ pub fn decode_raw_bytes(data: &[u8]) -> Result<DecodeResult, String> {
         white_levels,
         cfa_pattern: cfa_string,
         color_matrix,
+        tone_curve,
         xyz_to_cam_raw,
     };
 
@@ -363,8 +352,13 @@ fn normalize_crop_and_wb(
                     let wb = wb_mults[cfa_idx];
 
                     let raw_val = data[idx] as f32;
-                    let norm = ((raw_val - black) / (white - black)).max(0.0);
-                    normalized.push(norm * wb);
+                    let norm = ((raw_val - black) / (white - black)).clamp(0.0, 1.0);
+                    normalized.push(norm);
+
+                    // Debug print near our highlight
+                    if col >= 2480 && col <= 2490 && row == 1160 {
+                        println!("RAW({},{}) cfa={} raw={} blk={} wht={} -> norm={}", col, row, cfa_idx, raw_val, black, white, norm);
+                    }
                 }
             }
             Ok(normalized)
@@ -377,8 +371,8 @@ fn normalize_crop_and_wb(
                     let full_col = col + crop_left;
                     let idx = full_row * full_width + full_col;
                     let cfa_idx = (row % 2) * 2 + (col % 2);
-                    let wb = wb_mults[cfa_idx];
-                    normalized.push((data[idx] * wb).max(0.0));
+                    let norm = data[idx].clamp(0.0, 1.0);
+                    normalized.push(norm);
                 }
             }
             Ok(normalized)

@@ -8,7 +8,7 @@
 graph LR
     subgraph Browser
         A[File Input] -->|ArrayBuffer| B[WASM Module<br/>Rust + rawloader]
-        B -->|Linear RGB f32<br/>+ Metadata| C[WebGPU Pipeline<br/>Compute Shader]
+        B -->|Linear sRGB f32<br/>(DCP Color Pipeline)<br/>+ Metadata| C[WebGPU Pipeline<br/>Compute Shader]
         C -->|sRGB u8| D[Canvas Preview]
         E[UI Controls<br/>Next.js + TS] -->|Parameters| C
         D --> F[JPEG Export]
@@ -22,16 +22,17 @@ graph LR
 2. File API → ArrayBuffer としてメモリに読み込み
 3. ArrayBuffer を WASM (Rust) に渡す
 4. rawloader::decode() で RAW デコード
-5. Black/White level 補正 + Bayer デモザイク → Linear RGB (f32, 0.0–1.0)
-6. メタデータ (WB係数, black/white levels, CFA, カラーマトリクス) を JS 側に返却
-7. Linear RGB データを WebGPU Storage Buffer にアップロード
-8. Compute Shader で画像処理:
-   WB → 露出 → コントラスト → ハイライト/シャドウ → 彩度 → sRGB ガンマ
-9. 処理済みデータを Canvas にレンダリング
-10. スライダー操作 → パラメータ変更 → ステップ 8 のみ再実行（リアルタイム）
+5. Black/White level 補正 + カメラWB → Bayer デモザイク → Highlight Desaturation
+6. DCPプロファイルによる DNG Color Pipeline 適用 (CamRGB → ProPhoto → HSV LUT → ToneCurve → Linear sRGB) またはカラーマトリクスによる補正
+7. デコード結果 (Linear sRGB f32) とメタデータ (WB係数, CFA, カラーマトリクス等) を JS 側に返却
+8. Pixelデータを WebGPU Storage Buffer にアップロード
+9. Compute Shader で画像処理:
+   (ユーザー追加WB) → 露出 → ハイライト保護 → コントラスト → ハイライト/シャドウ → 彩度 → sRGB ガンマ
+10. 処理済みデータを Canvas にレンダリング
+11. スライダー操作 → パラメータ変更 → ステップ 9 のみ再実行（リアルタイム）
 ```
 
-> **Note:** ステップ 4〜6 の RAW デコードは **初回のみ** 実行。以降はステップ 8 の GPU パイプラインだけが再実行されるため、スライダー操作はリアルタイムに反映される。
+> **Note:** ステップ 4〜7 の RAW デコードと基本カラー変換は **初回のみ** 実行。以降はステップ 9 の GPU パイプラインだけが再実行されるため、スライダー操作はリアルタイムに反映される。
 
 ---
 
@@ -94,21 +95,25 @@ web-raw-dev/
 ```rust
 #[wasm_bindgen]
 pub fn decode_raw(data: &[u8]) -> Result<JsValue, JsError>
-// 返り値: { pixels: Float32Array, width, height, metadata: { wb_coeffs, ... } }
+// 返り値: { pixels: Float32Array, width, height, metadata: { wb_coeffs, color_matrix, ... }, display_referred: bool }
 ```
 
 #### 処理内容
 
 - `rawloader::decode(&mut Cursor<&[u8]>)` で RAW デコード
 - `RawImage` から CFA パターン、WB 係数、Black/White レベルを抽出
-- Black level 減算 + White level 正規化 → f32 [0.0, 1.0]
+- Black level 減算 + White level 正規化と、プレデモザイクWB適用 → f32 [0.0, 1.0]
 - Bayer bilinear デモザイク → RGB インターリーブ f32
+- Highlight Desaturation (クリップされたハイライト領域のみ彩度を落としマゼンタ被りを防止)
+- DNG Color Pipeline (DCPプロファイル) 適用、またはフォールバック行列適用による Linear sRGB 化
 - `serde-wasm-bindgen` で JS オブジェクトに変換
 
-#### デモザイクアルゴリズム
+#### デモザイクとカラーパイプライン
 
-- **Phase 1:** Bilinear 補間（現在の実装）
-- **Phase 2 (将来):** AHD / VNG 等の高品質アルゴリズム
+- **デモザイク:** Bilinear 補間（将来的にAHD / VNG等に拡張予定）
+- **DNG Color Pipeline:** 
+  DCPプロファイルが存在する場合、以下を適用して正確な色再現とトーンカーブ処理を実施。
+  CamRGB → (ForwardMatrix) → ProPhoto RGB → (HueSatMap / LookTable) → (ToneCurve) → Linear sRGB
 - 対応 CFA: RGGB, BGGR, GRBG, GBRG（rawloader::CFA から自動判定）
 
 ---
@@ -134,8 +139,9 @@ class ImageProcessor {
 
 | 処理 | 内容 |
 |------|------|
-| White Balance | RGB チャネルごとの乗算 |
+| White Balance | RGB チャネルごとの乗算（ユーザー調整分のみ） |
 | 露出 | `pow(2, EV)` による乗算 |
+| ハイライト保護 | 露出適用後、RGBの最大値が1.0を超える場合にスケーリングで色相を保持し保護 |
 | コントラスト | 0.5 中心の S カーブ |
 | ハイライト/シャドウ | smoothstep マスクによる選択的調整 |
 | 彩度 | Rec.709 輝度ベースの彩度調整 |
@@ -249,9 +255,8 @@ npm run build
 
 - WebGPU 非対応ブラウザ向け CPU フォールバック (Rust WASM 内処理)
 - 高品質デモザイク (AHD / VNG)
-- カラーマトリクス (camera RGB → XYZ → sRGB) の正確な実装
+- ユーザーカスタムLUT / カラーグレーディングのインポート
 - ノイズリダクション (Compute Shader)
 - シャープニング
-- LUT / カラーグレーディング
-- PNG エクスポート
+- PON エクスポート等の他フォーマット対応
 - WASM SIMD 最適化

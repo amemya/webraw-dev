@@ -22,6 +22,27 @@ struct Params {
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> tone_curve: array<f32>;
+
+// Helper to interpolate 1D LUT
+fn sample_tone_curve(x: f32) -> f32 {
+  let len = arrayLength(&tone_curve);
+  if (len <= 1u) { 
+    return min(x, 1.0); // Fallback: preserve hue by scaling down to 1.0
+  }
+  
+  let clamped_x = clamp(x, 0.0, 1.0);
+  let max_idx = f32(len - 1u);
+  let scaled = clamped_x * max_idx;
+  let idx0 = u32(scaled);
+  let idx1 = min(idx0 + 1u, len - 1u);
+  let fract = scaled - f32(idx0);
+  
+  let v0 = tone_curve[idx0];
+  let v1 = tone_curve[idx1];
+  
+  return mix(v0, v1, fract);
+}
 
 // sRGB gamma encoding
 fn linear_to_srgb(c: f32) -> f32 {
@@ -99,13 +120,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   g = g * exp_mul;
   b = b * exp_mul;
 
-  // 3. Highlight preservation after exposure
-  // Instead of independent clamping which destroys hues, scale brightness to fit
+  // 3. Tone Curve (DCP S-Curve) with Highlight Roll-off
+  // First, apply tone curve while preserving hue by scaling all channels uniformly.
   let max_c = max(r, max(g, b));
-  if (max_c > 1.0) {
-      r = r / max_c;
-      g = g / max_c;
-      b = b / max_c;
+  if (max_c > 0.0) {
+      let tc_max = sample_tone_curve(max_c);
+      let scale = tc_max / max_c;
+      r = r * scale;
+      g = g * scale;
+      b = b * scale;
+      
+      // Highlight Roll-off (Burn to White)
+      // When the linear color exceeds 1.0 (overexposed), it should naturally desaturate to white.
+      // This prevents fully saturated "neon" patches for bright lights.
+      let desat_start = 1.0;
+      let desat_end = 2.5; 
+      if (max_c > desat_start) {
+          var blend = clamp((max_c - desat_start) / (desat_end - desat_start), 0.0, 1.0);
+          blend = blend * blend * (3.0 - 2.0 * blend); // smoothstep
+          
+          // Blend towards pure white (tc_max)
+          r = mix(r, tc_max, blend);
+          g = mix(g, tc_max, blend);
+          b = mix(b, tc_max, blend);
+      }
   }
   
   // Minor clamp to fix any absolute lower bound issues or floating point drift

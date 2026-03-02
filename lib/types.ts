@@ -11,6 +11,7 @@ export interface RawMetadata {
   white_levels: number[];
   cfa_pattern: string;
   color_matrix: number[];
+  tone_curve: number[];
   xyz_to_cam_raw: number[];
 }
 

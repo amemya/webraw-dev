@@ -42,6 +42,7 @@ pub fn apply_dcp_pipeline(
     height: usize,
     profile: &DcpProfile,
     temperature: f64,
+    wb_mults: &[f32; 3],
 ) {
     // 1. Compute interpolated ForwardMatrix based on color temperature
     let forward_matrix = interpolate_matrix(profile, temperature);
@@ -53,97 +54,153 @@ pub fn apply_dcp_pipeline(
     // 3. Compute combined ProPhoto → sRGB (linear) matrix
     let prophoto_to_srgb = mat_mul_3x3(&XYZ_D50_TO_SRGB, &PROPHOTO_TO_XYZ);
 
-    // 4. Build tone curve LUT for fast lookup
-    let tone_lut = build_tone_lut(profile);
+    // Baseline exposure offset (convert from EV to linear multiplier)
+    let baseline_exposure = profile.baseline_exposure_offset.unwrap_or(0.0);
+    // Remove the arbitrary +2.0 EV boost to match actual camera standard brightness
+    let total_exposure = baseline_exposure;
+    let exposure_multiplier = 2.0f64.powf(total_exposure);
+
+    // Get the WB multipliers to know the clip points
+    let wb_r = wb_mults[0] as f64;
+    let wb_g = wb_mults[1] as f64;
+    let wb_b = wb_mults[2] as f64;
 
     // 5. Process each pixel
-    //    Pipeline: CamRGB → ProPhoto → HSV(LookTable) → ProPhoto
-    //              → sRGB(linear, via matrix) → tone curve → sRGB(display-referred)
+    //    Pipeline: CamRGB → ProPhoto → HSV(LookTable) → ProPhoto → Exposure Boost → sRGB(linear, via matrix)
     for i in 0..(width * height) {
         let idx = i * 3;
-        let r = pixels[idx] as f64;
-        let g = pixels[idx + 1] as f64;
-        let b = pixels[idx + 2] as f64;
+        let mut r = pixels[idx] as f64;
+        let mut g = pixels[idx + 1] as f64;
+        let mut b = pixels[idx + 2] as f64;
+
+        let mut norm_r = r / wb_r;
+        let mut norm_g = g / wb_g;
+        let mut norm_b = b / wb_b;
+        
+        // --- Hue-Preserving Highlight Reconstruction (Camera Space) ---
+        // Yellow bokehs turning orange happen because R and G clip at sensor max (1.0), 
+        // but applying White Balance scales them differently (e.g., R x 2.5, G x 1.0),
+        // changing the physical hue ratio towards red/orange.
+        
+        let max_norm = norm_r.max(norm_g).max(norm_b);
+        let clip_thresh = 0.95; 
+
+        if max_norm > clip_thresh {
+            let blend = ((max_norm - clip_thresh) / (1.0 - clip_thresh)).clamp(0.0, 1.0);
+            let smooth_blend = blend * blend * (3.0 - 2.0 * blend);
+            
+            // Just desaturate towards Luma in WB-applied space to avoid out-of-bounds math
+            let luma = r * 0.299 + g * 0.587 + b * 0.114;
+            r = r * (1.0 - smooth_blend) + luma * smooth_blend;
+            g = g * (1.0 - smooth_blend) + luma * smooth_blend;
+            b = b * (1.0 - smooth_blend) + luma * smooth_blend;
+        }
 
         // Camera RGB → ProPhoto RGB via ForwardMatrix
-        let pr = (cam_to_prophoto[0] * r + cam_to_prophoto[1] * g + cam_to_prophoto[2] * b).max(0.0);
-        let pg = (cam_to_prophoto[3] * r + cam_to_prophoto[4] * g + cam_to_prophoto[5] * b).max(0.0);
-        let pb = (cam_to_prophoto[6] * r + cam_to_prophoto[7] * g + cam_to_prophoto[8] * b).max(0.0);
+        let mut pr = cam_to_prophoto[0] * r + cam_to_prophoto[1] * g + cam_to_prophoto[2] * b;
+        let mut pg = cam_to_prophoto[3] * r + cam_to_prophoto[4] * g + cam_to_prophoto[5] * b;
+        let mut pb = cam_to_prophoto[6] * r + cam_to_prophoto[7] * g + cam_to_prophoto[8] * b;
 
-        // Apply LookTable (encoding-dependent)
-        // When look_table_encoding=1, HSV is computed from sRGB gamma-encoded ProPhoto RGB.
-        // This changes the hue calculation — critical for correct yellow/orange rendering.
-        let (mut pr2, mut pg2, mut pb2) = (pr, pg, pb);
+        // Prevent underflow artifacts (black pixels) from negative matrix math on out-of-gamut clipped colors
+        pr = pr.max(0.0);
+        pg = pg.max(0.0);
+        pb = pb.max(0.0);
 
-        // 1. Apply HueSatMap FIRST (uses hue_sat_map_encoding, applied to linear ProPhoto)
-        if let Some(ref dims) = profile.hue_sat_map_dims {
-            let hsm_data = interpolate_hue_sat_map(profile, temperature);
-            if !hsm_data.is_empty() {
-                if profile.hue_sat_map_encoding == 1 {
-                    let pr_g = linear_to_srgb_f64(pr2);
-                    let pg_g = linear_to_srgb_f64(pg2);
-                    let pb_g = linear_to_srgb_f64(pb2);
-                    let (mut h, mut s, mut v) = rgb_to_hsv(pr_g, pg_g, pb_g);
-                    apply_hue_sat_map(dims, &hsm_data, &mut h, &mut s, &mut v);
-                    let (rg, gg, bg) = hsv_to_rgb(h, s, v);
-                    pr2 = srgb_to_linear_f64(rg);
-                    pg2 = srgb_to_linear_f64(gg);
-                    pb2 = srgb_to_linear_f64(bg);
-                } else {
-                    let (mut h, mut s, mut v) = rgb_to_hsv(pr2, pg2, pb2);
-                    apply_hue_sat_map(dims, &hsm_data, &mut h, &mut s, &mut v);
-                    let (r2, g2, b2) = hsv_to_rgb(h, s, v);
-                    pr2 = r2; pg2 = g2; pb2 = b2;
+        let col = (idx / 3) % width;
+        let row = (idx / 3) / width;
+        if col >= 2480 && col <= 2490 && row == 1160 {
+            println!("MAT({},{}): in({:.4},{:.4},{:.4}) -> prophoto({:.4},{:.4},{:.4})", col, row, r, g, b, pr, pg, pb);
+        }
+
+        let mut pr2 = pr;
+        let mut pg2 = pg;
+        let mut pb2 = pb;
+
+        let desat_start = 0.85; 
+        let desat_end = 0.98;
+        let mut lut_blend = 1.0;
+        
+        if max_norm > desat_start {
+            let mut blend = ((max_norm - desat_start) / (desat_end - desat_start)).clamp(0.0, 1.0);
+            blend = blend * blend * (3.0 - 2.0 * blend);
+            
+            // Fade out LUT effect entirely for highlights to prevent weird hue shifts
+            lut_blend = 1.0 - blend;
+        }
+
+        // 1. Apply HueSatMap FIRST
+            if let Some(ref dims) = profile.hue_sat_map_dims {
+                let hsm_data = interpolate_hue_sat_map(profile, temperature);
+                if !hsm_data.is_empty() {
+                    let mut pr_h = pr2; let mut pg_h = pg2; let mut pb_h = pb2;
+                    if profile.hue_sat_map_encoding == 1 {
+                        let pr_g = linear_to_srgb_f64(pr_h);
+                        let pg_g = linear_to_srgb_f64(pg_h);
+                        let pb_g = linear_to_srgb_f64(pb_h);
+                        let (mut h, mut s, mut v) = rgb_to_hsv(pr_g, pg_g, pb_g);
+                        apply_hue_sat_map(dims, &hsm_data, &mut h, &mut s, &mut v);
+                        let (rg, gg, bg) = hsv_to_rgb(h, s, v);
+                        pr_h = srgb_to_linear_f64(rg);
+                        pg_h = srgb_to_linear_f64(gg);
+                        pb_h = srgb_to_linear_f64(bg);
+                    } else {
+                        let (mut h, mut s, mut v) = rgb_to_hsv(pr_h, pg_h, pb_h);
+                        apply_hue_sat_map(dims, &hsm_data, &mut h, &mut s, &mut v);
+                        let (r2, g2, b2) = hsv_to_rgb(h, s, v);
+                        pr_h = r2; pg_h = g2; pb_h = b2;
+                    }
+                    pr2 = pr2 * (1.0 - lut_blend) + pr_h * lut_blend;
+                    pg2 = pg2 * (1.0 - lut_blend) + pg_h * lut_blend;
+                    pb2 = pb2 * (1.0 - lut_blend) + pb_h * lut_blend;
                 }
             }
-        }
 
-        // 2. Apply LookTable SECOND (encoding-dependent)
-        if let (Some(ref dims), Some(ref data)) = (&profile.look_table_dims, &profile.look_table_data) {
-            if profile.look_table_encoding == 1 {
-                // sRGB encoding: gamma-encode → HSV → adjust → HSV→RGB → de-gamma
-                let pr_g = linear_to_srgb_f64(pr2);
-                let pg_g = linear_to_srgb_f64(pg2);
-                let pb_g = linear_to_srgb_f64(pb2);
-                let (mut h, mut s, mut v) = rgb_to_hsv(pr_g, pg_g, pb_g);
-                apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
-                let (rg, gg, bg) = hsv_to_rgb(h, s, v);
-                pr2 = srgb_to_linear_f64(rg);
-                pg2 = srgb_to_linear_f64(gg);
-                pb2 = srgb_to_linear_f64(bg);
-            } else {
-                // Linear encoding: HSV from linear ProPhoto directly
-                let (mut h, mut s, mut v) = rgb_to_hsv(pr2, pg2, pb2);
-                apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
-                let (r2, g2, b2) = hsv_to_rgb(h, s, v);
-                pr2 = r2; pg2 = g2; pb2 = b2;
+            // 2. Apply LookTable NEXT
+            if let (Some(ref dims), Some(ref data)) = (&profile.look_table_dims, &profile.look_table_data) {
+                let mut pr_h = pr2; let mut pg_h = pg2; let mut pb_h = pb2;
+                if profile.look_table_encoding == 1 {
+                    let pr_g = linear_to_srgb_f64(pr_h);
+                    let pg_g = linear_to_srgb_f64(pg_h);
+                    let pb_g = linear_to_srgb_f64(pb_h);
+                    let (mut h, mut s, mut v) = rgb_to_hsv(pr_g, pg_g, pb_g);
+                    apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
+                    let (rg, gg, bg) = hsv_to_rgb(h, s, v);
+                    pr_h = srgb_to_linear_f64(rg);
+                    pg_h = srgb_to_linear_f64(gg);
+                    pb_h = srgb_to_linear_f64(bg);
+                } else {
+                    let (mut h, mut s, mut v) = rgb_to_hsv(pr_h, pg_h, pb_h);
+                    apply_hue_sat_map(dims, data, &mut h, &mut s, &mut v);
+                    let (r2, g2, b2) = hsv_to_rgb(h, s, v);
+                    pr_h = r2; pg_h = g2; pb_h = b2;
+                }
+                pr2 = pr2 * (1.0 - lut_blend) + pr_h * lut_blend;
+                pg2 = pg2 * (1.0 - lut_blend) + pg_h * lut_blend;
+                pb2 = pb2 * (1.0 - lut_blend) + pb_h * lut_blend;
             }
-        }
-
-        // 3. Apply Tone Curve to Linear ProPhoto RGB independently
-        // Do not clamp the output, allowing highlights to stay > 1.0 (requires extrapolated lut)
-        let pr3 = apply_tone_curve(&tone_lut, pr2);
-        let pg3 = apply_tone_curve(&tone_lut, pg2);
-        let pb3 = apply_tone_curve(&tone_lut, pb2);
-
-        // 4. Decode Melissa RGB (sRGB gamma) to get back to Linear ProPhoto Space
-        // Note: DNG specification defines Tone Curve output as having an sRGB gamma
-        let pr_lin = srgb_to_linear_f64(pr3);
-        let pg_lin = srgb_to_linear_f64(pg3);
-        let pb_lin = srgb_to_linear_f64(pb3);
+        // 3. Convert back to Linear sRGB
+        let pr_lin = pr2;
+        let pg_lin = pg2;
+        let pb_lin = pb2;
 
         // 5. Apply ProPhoto → sRGB (linear) matrix
-        let sr = (prophoto_to_srgb[0] * pr_lin + prophoto_to_srgb[1] * pg_lin + prophoto_to_srgb[2] * pb_lin).max(0.0);
-        let sg = (prophoto_to_srgb[3] * pr_lin + prophoto_to_srgb[4] * pg_lin + prophoto_to_srgb[5] * pb_lin).max(0.0);
-        let sb = (prophoto_to_srgb[6] * pr_lin + prophoto_to_srgb[7] * pg_lin + prophoto_to_srgb[8] * pb_lin).max(0.0);
+        let mut sr = prophoto_to_srgb[0] * pr_lin + prophoto_to_srgb[1] * pg_lin + prophoto_to_srgb[2] * pb_lin;
+        let mut sg = prophoto_to_srgb[3] * pr_lin + prophoto_to_srgb[4] * pg_lin + prophoto_to_srgb[5] * pb_lin;
+        let mut sb = prophoto_to_srgb[6] * pr_lin + prophoto_to_srgb[7] * pg_lin + prophoto_to_srgb[8] * pb_lin;
 
-        // 6. Output Linear sRGB
+        // Prevent negative values from out-of-gamut colors before applying exposure
+        // Negative linear values cannot be represented and cause zero-clipping artifacts in sRGB
+        sr = sr.max(0.0);
+        sg = sg.max(0.0);
+        sb = sb.max(0.0);
+
+        // 6. Output Linear sRGB with Baseline Exposure offset
         // We do *not* apply sRGB gamma here because the pipeline expects linear sRGB
         // so that subsequent filters (exposure, contrast) and final gamma encoding
         // can be properly applied by the WebGPU shader or raw2ppm tool.
-        pixels[idx] = sr as f32;
-        pixels[idx + 1] = sg as f32;
-        pixels[idx + 2] = sb as f32;
+        pixels[idx] = (sr * exposure_multiplier) as f32;
+        pixels[idx + 1] = (sg * exposure_multiplier) as f32;
+        pixels[idx + 2] = (sb * exposure_multiplier) as f32;
     }
 }
 
@@ -289,11 +346,24 @@ fn apply_hue_sat_map(
     // Interpolate over hue
     let e0 = interp_sat(hue_idx0);
     let e1 = interp_sat(hue_idx1);
-    let final_entry = HueSatMapEntry {
+    let mut final_entry = HueSatMapEntry {
         hue_shift: e0.hue_shift + (e1.hue_shift - e0.hue_shift) * hue_frac as f32,
         sat_scale: e0.sat_scale + (e1.sat_scale - e0.sat_scale) * hue_frac as f32,
         val_scale: e0.val_scale + (e1.val_scale - e0.val_scale) * hue_frac as f32,
     };
+
+    // Fade out effect for extreme highlights (V > 0.85)
+    // DCP LUTs are often extremely non-linear near the white point, causing luminance dips
+    // that manifest as rings/banding when combined with local demosaic noise.
+    let val_fade = if *v > 0.85 {
+        (1.0 - (*v - 0.85) / 0.15).clamp(0.0, 1.0) as f32
+    } else {
+        1.0
+    };
+    
+    final_entry.hue_shift *= val_fade;
+    final_entry.sat_scale = 1.0 + (final_entry.sat_scale - 1.0) * val_fade;
+    final_entry.val_scale = 1.0 + (final_entry.val_scale - 1.0) * val_fade;
 
     // Apply adjustments
     // hue_shift: additive offset in degrees
@@ -343,6 +413,12 @@ fn build_tone_lut(profile: &DcpProfile) -> Vec<f64> {
     }
 
     lut
+}
+
+/// Build a 4096-entry tone curve LUT as f32 for exporting to WebGPU
+pub fn build_tone_lut_f32(profile: &DcpProfile) -> Vec<f32> {
+    let lut_f64 = build_tone_lut(profile);
+    lut_f64.into_iter().map(|v| v as f32).collect()
 }
 
 /// Apply tone curve via LUT lookup

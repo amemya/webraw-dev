@@ -109,8 +109,9 @@ export default function Editor() {
             // Create processor
             const processor = new ImageProcessor(device);
             await processor.init();
-            console.log("[RAW Processor] Uploading image to GPU...");
+            console.log("[RAW Processor] Uploading image and metadata to GPU...");
             await processor.uploadImage(decoded.pixels, decoded.width, decoded.height);
+            await processor.uploadMetadata(decoded.metadata);
 
             // Clean up previous processor
             processorRef.current?.destroy();

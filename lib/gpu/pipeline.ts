@@ -11,6 +11,7 @@ export class ImageProcessor {
     private inputBuffer: GPUBuffer | null = null;
     private outputBuffer: GPUBuffer | null = null;
     private paramsBuffer: GPUBuffer | null = null;
+    private toneCurveBuffer: GPUBuffer | null = null;
     private bindGroup: GPUBindGroup | null = null;
 
     private imageWidth = 0;
@@ -45,6 +46,11 @@ export class ImageProcessor {
                     binding: 2,
                     visibility: GPUShaderStage.COMPUTE,
                     buffer: { type: "uniform" },
+                },
+                {
+                    binding: 3,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "read-only-storage" },
                 },
             ],
         });
@@ -94,14 +100,50 @@ export class ImageProcessor {
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
         });
 
+        // Create default empty tone curve buffer if metadata not loaded yet
+        if (!this.toneCurveBuffer) {
+            this.toneCurveBuffer = this.device.createBuffer({
+                label: "tonecurve-buffer",
+                size: 4, // minimum size
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            const defaultCurve = new Float32Array([0.0]);
+            this.device.queue.writeBuffer(this.toneCurveBuffer, 0, defaultCurve);
+        }
+
+        this._createBindGroup();
+    }
+
+    async uploadMetadata(metadata: import("../types").RawMetadata): Promise<void> {
+        if (metadata.tone_curve && metadata.tone_curve.length > 0) {
+            const curveData = new Float32Array(metadata.tone_curve);
+            if (this.toneCurveBuffer) this.toneCurveBuffer.destroy();
+
+            this.toneCurveBuffer = this.device.createBuffer({
+                label: "tonecurve-buffer",
+                size: Math.max(curveData.byteLength, 4),
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            this.device.queue.writeBuffer(this.toneCurveBuffer, 0, curveData);
+
+            if (this.inputBuffer && this.outputBuffer && this.paramsBuffer) {
+                this._createBindGroup();
+            }
+        }
+    }
+
+    private _createBindGroup() {
+        if (!this.pipeline || !this.inputBuffer || !this.outputBuffer || !this.paramsBuffer || !this.toneCurveBuffer) return;
+
         // Create bind group
         this.bindGroup = this.device.createBindGroup({
             label: "process-bind-group",
-            layout: this.pipeline!.getBindGroupLayout(0),
+            layout: this.pipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: this.inputBuffer } },
                 { binding: 1, resource: { buffer: this.outputBuffer } },
-                { binding: 2, resource: { buffer: this.paramsBuffer! } },
+                { binding: 2, resource: { buffer: this.paramsBuffer } },
+                { binding: 3, resource: { buffer: this.toneCurveBuffer } },
             ],
         });
     }
@@ -220,6 +262,7 @@ export class ImageProcessor {
         this.inputBuffer?.destroy();
         this.outputBuffer?.destroy();
         this.paramsBuffer?.destroy();
+        this.toneCurveBuffer?.destroy();
         this.lastRenderedData = null;
     }
 }
