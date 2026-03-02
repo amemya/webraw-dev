@@ -47,3 +47,6 @@ crate/target
 
 # OS
 .DS_Store
+
+# test outputs
+*.ppm
