@@ -110,15 +110,22 @@ fn interpolate_g_at_r_or_b(raw: &[f32], width: usize, height: usize, row: usize,
     let n2 = get_pixel(raw, width, height, r + 1, c);
     let n3 = get_pixel(raw, width, height, r, c - 1);
     let n4 = get_pixel(raw, width, height, r, c + 1);
-    let min_n = n1.min(n2).min(n3).min(n4).min(center);
-    let max_n = n1.max(n2).max(n3).max(n4).max(center);
-    let contrast = max_n - min_n;
+    
+    let min_n = n1.min(n2).min(n3).min(n4);
+    let max_n = n1.max(n2).max(n3).max(n4);
+    
+    let min_c = min_n.min(center);
+    let max_c = max_n.max(center);
+    let contrast = max_c - min_c;
     
     // Attenuate correction as contrast increases (protects highlights)
     let attenuation = (1.0 - contrast * 2.0).clamp(0.0, 1.0);
     let correction = laplacian * 0.5 * attenuation;
     
-    (base + correction).clamp(0.0, 1.0)
+    let mut val = base + correction;
+    val = val.clamp(min_n, max_n);
+    
+    val.clamp(0.0, 1.0)
 }
 
 // B at R location or R at B location (same filter shape)
@@ -153,14 +160,18 @@ fn interpolate_diagonal(raw: &[f32], width: usize, height: usize, row: usize, co
     let n2 = get_pixel(raw, width, height, r - 1, c + 1);
     let n3 = get_pixel(raw, width, height, r + 1, c - 1);
     let n4 = get_pixel(raw, width, height, r + 1, c + 1);
-    let min_n = n1.min(n2).min(n3).min(n4).min(center);
-    let max_n = n1.max(n2).max(n3).max(n4).max(center);
+    let min_n = n1.min(n2).min(n3).min(n4);
+    let max_n = n1.max(n2).max(n3).max(n4);
     let contrast = max_n - min_n;
     
     let attenuation = (1.0 - contrast * 2.0).clamp(0.0, 1.0);
     let correction = laplacian * 0.75 * attenuation;
     
-    (base + correction).clamp(0.0, 1.0)
+    // Hard clamp to identical-color neighbor bounds to prevent shadow dropouts
+    let mut val = base + correction;
+    val = val.clamp(min_n, max_n);
+    
+    val.clamp(0.0, 1.0)
 }
 
 // R and B at G location
@@ -186,22 +197,30 @@ fn interpolate_rb_at_g(raw: &[f32], width: usize, height: usize, row: usize, col
     let nh1 = get_pixel(raw, width, height, r, c - 1);
     let nh2 = get_pixel(raw, width, height, r, c + 1);
     
-    let min_v = nv1.min(nv2).min(center);
-    let max_v = nv1.max(nv2).max(center);
-    let min_h = nh1.min(nh2).min(center);
-    let max_h = nh1.max(nh2).max(center);
+    let min_v = nv1.min(nv2);
+    let max_v = nv1.max(nv2);
+    let min_h = nh1.min(nh2);
+    let max_h = nh1.max(nh2);
     
     let contrast_v = max_v - min_v;
     let contrast_h = max_h - min_h;
     
+    // For Green channels, attenuation should be gentle
     let atten_v = (1.0 - contrast_v * 2.0).clamp(0.0, 1.0);
     let atten_h = (1.0 - contrast_h * 2.0).clamp(0.0, 1.0);
 
     let corr_v = laplacian_v * 0.625 * atten_v;
     let corr_h = laplacian_h * 0.625 * atten_h;
     
-    let val_v = (base_v + corr_v).clamp(0.0, 1.0);
-    let val_h = (base_h + corr_h).clamp(0.0, 1.0);
+    let mut val_v = base_v + corr_v;
+    let mut val_h = base_h + corr_h;
+    
+    // Clamp to neighbor min/max to prevent zipper dropout
+    val_v = val_v.clamp(min_v, max_v);
+    val_h = val_h.clamp(min_h, max_h);
+    
+    val_v = val_v.clamp(0.0, 1.0);
+    val_h = val_h.clamp(0.0, 1.0);
 
     match above_color {
         CfaColor::Red => {
