@@ -116,8 +116,8 @@ pub fn apply_dcp_pipeline(
         let mut pg2 = pg;
         let mut pb2 = pb;
 
-        let desat_start = 0.85; 
-        let desat_end = 0.98;
+        let desat_start = 0.5; 
+        let desat_end = 0.9;
         let mut lut_blend = 1.0;
         
         if max_norm > desat_start {
@@ -189,10 +189,23 @@ pub fn apply_dcp_pipeline(
         let mut sb = prophoto_to_srgb[6] * pr_lin + prophoto_to_srgb[7] * pg_lin + prophoto_to_srgb[8] * pb_lin;
 
         // Prevent negative values from out-of-gamut colors before applying exposure
-        // Negative linear values cannot be represented and cause zero-clipping artifacts in sRGB
-        sr = sr.max(0.0);
-        sg = sg.max(0.0);
-        sb = sb.max(0.0);
+        // Instead of hard-clipping to 0 (which causes hue shifts and zipper noise),
+        // we desaturate the color towards its luma until the lowest channel is >= 0.
+        let min_c = sr.min(sg).min(sb);
+        if min_c < 0.0 {
+            let luma = sr * 0.2126 + sg * 0.7152 + sb * 0.0722;
+            if luma > 0.0 {
+                let target_min = luma * 0.15;
+                let blend = ((target_min - min_c) / (luma - min_c)).clamp(0.0, 1.0);
+                sr = sr * (1.0 - blend) + luma * blend;
+                sg = sg * (1.0 - blend) + luma * blend;
+                sb = sb * (1.0 - blend) + luma * blend;
+            }
+            // Final safety clamp just in case of floating point inaccuracies
+            sr = sr.max(0.0);
+            sg = sg.max(0.0);
+            sb = sb.max(0.0);
+        }
 
         // 6. Output Linear sRGB with Baseline Exposure offset
         // We do *not* apply sRGB gamma here because the pipeline expects linear sRGB

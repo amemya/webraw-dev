@@ -79,7 +79,21 @@ fn write_ppm(path: &str, pixels: &[f32], w: usize, h: usize, display_referred: b
             let mut g = pixels[idx + 1];
             let mut b = pixels[idx + 2];
 
-            
+            // Handle out-of-gamut colors (negative values) gracefully
+            // by desaturating towards luma instead of hard clipping to 0,
+            // which causes zipper noise artifacts.
+            let min_c = r.min(g).min(b);
+            if min_c < 0.0 {
+                let luma = r * 0.2126 + g * 0.7152 + b * 0.0722;
+                if luma > 0.0 {
+                    let target_min = luma * 0.15;
+                    let blend = ((target_min - min_c) / (luma - min_c)).clamp(0.0, 1.0);
+                    r = r * (1.0 - blend) + luma * blend;
+                    g = g * (1.0 - blend) + luma * blend;
+                    b = b * (1.0 - blend) + luma * blend;
+                }
+            }
+
             r = r.clamp(0.0, 1.0);
             g = g.clamp(0.0, 1.0);
             b = b.clamp(0.0, 1.0);
